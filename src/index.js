@@ -1,5 +1,13 @@
-module.exports = function(schema, option) {
-  const {prettier} = option;
+const nameMapping = {
+  'page': 'View',
+  'text': 'Text',
+  'div': 'View',
+  'image': 'Image',
+  'block': 'View'
+}
+
+module.exports = function (schema, option) {
+  const { prettier } = option;
 
   // imports
   const imports = [];
@@ -13,8 +21,8 @@ module.exports = function(schema, option) {
   // Classes 
   const classes = [];
 
-  // 1vw = width / 100
-  const _w = option.responsive.width / 100;
+  // import 组件名称列表
+  const componentNames = {};
 
   const isExpression = (value) => {
     return /^\{\{.*\}\}$/.test(value);
@@ -41,37 +49,38 @@ module.exports = function(schema, option) {
   };
 
   // convert to responsive unit, such as vw
-  const parseStyle = (style) => {
+  const parseStyle = (style, type) => {
+    const parsedStyles = [];
+    const exceptRnStyles = [];
+
     for (let key in style) {
+      const name = key.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLocaleLowerCase();
+      const value = style[key];
+
+      if (type === 'text' && (key === 'width' || key === 'height')) {
+        continue;
+      }
+
       switch (key) {
-        case 'fontSize':
-        case 'marginTop':
-        case 'marginBottom':
-        case 'paddingTop':
-        case 'paddingBottom':
-        case 'height':
-        case 'top':
-        case 'bottom':
-        case 'width':
-        case 'maxWidth':
-        case 'left':
-        case 'right':
-        case 'paddingRight':
-        case 'paddingLeft':
-        case 'marginLeft':
-        case 'marginRight':
-        case 'lineHeight':
-        case 'borderBottomRightRadius':
-        case 'borderBottomLeftRadius':
-        case 'borderTopRightRadius':
-        case 'borderTopLeftRadius':
-        case 'borderRadius':
-          style[key] = (parseInt(style[key]) / _w).toFixed(2) + 'vw';
+        case 'whiteSpace':
+        case 'boxSizing':
+        case 'backgroundImage':
+        case 'borderBottomStyle':
+        case 'textOverflow':
+        case 'visibility':
+        case 'filter':
+          exceptRnStyles.push(`${name}: ${value}`);
           break;
+        default:
+          parsedStyles.push(`${name}: ${value}`);
       }
     }
 
-    return style;
+    if (exceptRnStyles.length > 0) {
+      exceptRnStyles.unshift('\n/*  #ifndef rn */\n');
+      exceptRnStyles.push('\n/*  #endif */\n');
+    }
+    return parsedStyles.concat(exceptRnStyles);
   }
 
   // parse function, return params and content
@@ -102,7 +111,7 @@ module.exports = function(schema, option) {
         return `'${value}'`;
       }
     } else if (typeof value === 'function') {
-      const {params, content} = parseFunction(value);
+      const { params, content } = parseFunction(value);
       return `(${params}) => {${content}}`;
     }
   }
@@ -110,7 +119,7 @@ module.exports = function(schema, option) {
   // parse async dataSource
   const parseDataSource = (data) => {
     const name = data.id;
-    const {uri, method, params} = data.options;
+    const { uri, method, params } = data.options;
     const action = data.type;
     let payload = {};
 
@@ -201,11 +210,13 @@ module.exports = function(schema, option) {
   const generateRender = (schema) => {
     const type = schema.componentName.toLowerCase();
     const className = schema.props && schema.props.className;
-    const classString = className ? ` style={styles.${className}}` : '';
+    const classString = className ? ` className='${className}'` : '';
 
     if (className) {
-      style[className] = parseStyle(schema.props.style);
+      style[className] = parseStyle(schema.props.style, type);
     }
+
+    componentNames[nameMapping[type]] = true;
 
     let xml;
     let props = '';
@@ -216,22 +227,23 @@ module.exports = function(schema, option) {
       }
     })
 
-    switch(type) {
+    // 设置标签类型
+    switch (type) {
       case 'text':
         const innerText = parseProps(schema.props.text, true);
-        xml = `<span${classString}${props}>${innerText}</span>`;
+        xml = `<${nameMapping[type]}${classString}${props}>${innerText}</${nameMapping[type]}>`;
         break;
       case 'image':
         const source = parseProps(schema.props.src);
-        xml = `<img${classString}${props} src={${source}} />`;
+        xml = `<${nameMapping[type]}${classString}${props} src={require(${source})} />`;
         break;
       case 'div':
       case 'page':
       case 'block':
         if (schema.children && schema.children.length) {
-          xml = `<div${classString}${props}>${transform(schema.children)}</div>`;
+          xml = `<${nameMapping[type]}${classString}${props}>${transform(schema.children)}</${nameMapping[type]}>`;
         } else {
-          xml = `<div${classString}${props} />`;
+          xml = `<${nameMapping[type]}${classString}${props} />`;
         }
         break;
     }
@@ -267,7 +279,7 @@ module.exports = function(schema, option) {
         const methods = [];
         const init = [];
         const render = [`render(){ return (`];
-        let classData = [`class ${schema.componentName}_${classes.length} extends Component {`];
+        let classData = [`class Index extends Component {`];
 
         if (schema.state) {
           states.push(`state = ${toString(schema.state)}`);
@@ -337,11 +349,17 @@ module.exports = function(schema, option) {
   // start parse schema
   transform(schema);
 
-  const prettierOpt = {
-    parser: 'babel',
-    printWidth: 120,
-    singleQuote: true
-  };
+
+  // 输出外部类样式
+  function printOuterStyle(style) {
+    let result = '';
+    for (let key in style) {
+      result += `.${key} {
+         ${style[key].join(';')} 
+        } \n`
+    }
+    return result;
+  }
 
   return {
     panelDisplay: [
@@ -349,20 +367,27 @@ module.exports = function(schema, option) {
         panelName: `index.jsx`,
         panelValue: prettier.format(`
           'use strict';
-
-          import React, { Component } from 'react';
+          import Taro from '@tarojs/taro';
+          import { ${Object.keys(componentNames).join(', ')} } from '@tarojs/components';
           ${imports.join('\n')}
-          import styles from './style.js';
+          import './index.less';
           ${utils.join('\n')}
           ${classes.join('\n')}
-          export default ${schema.componentName}_0;
-        `, prettierOpt),
+          export default Index;
+        `, {
+          parser: 'babel',
+          printWidth: 120,
+          singleQuote: true
+        }),
         panelType: 'js',
       },
       {
-        panelName: `style.js`,
-        panelValue: prettier.format(`export default ${toString(style)}`, prettierOpt),
-        panelType: 'js'
+        panelName: `index.less`,
+        panelValue: prettier.format(`${printOuterStyle(style)}`, {
+          parser: 'less',
+          printWidth: 120,
+        }),
+        panelType: 'less'
       }
     ],
     noTemplate: true
